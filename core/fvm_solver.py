@@ -7,52 +7,68 @@ class PackedBedSolver:
         self.cfg, self.mesh = cfg, mesh
         self.N = cfg.NR * cfg.NZ
 
-    def solve_pressure(self, P_old, T, S_gas_total):
-        """ Implicit FVM for Darcy Pressure: d(rho_g)/dt + div(rho_g*u) = S_gas """
+    def solve_pressure(self, P_old, T, dn_generated):
+        """ 
+        Implicit FVM for Pressure based on Molar Continuity PDE.
+        BCs (JSON): r=0 (Sym), r=R (Impermeable), z=0 (Impermeable), z=L (Dirichlet Outlet)
+        """
         A = sparse.lil_matrix((self.N, self.N))
         B = np.zeros(self.N)
         
-        # Diffusivity for Pressure (Darcy)
-        coeff_D = (self.cfg.PERMEABILITY / self.cfg.MU_GAS) * (self.cfg.M_GAS / (self.cfg.R_GAS * T))
-        trans_const = (self.cfg.POROSITY * self.cfg.M_GAS) / (self.cfg.R_GAS * T * self.cfg.DT)
+        molar_mobility = (self.cfg.PERMEABILITY * P_old) / (self.cfg.MU_GAS * self.cfg.R_GAS * T)
+        molar_trans_const = self.cfg.POROSITY / (self.cfg.R_GAS * T * self.cfg.DT)
 
         for i in range(self.cfg.NR):
             for j in range(self.cfg.NZ):
                 idx = i * self.cfg.NZ + j
                 
-                # Top Boundary (Open to Atm)
+                # --- BC: Top (z=L) Dirichlet Outlet (JSON Spec) ---
                 if j == self.cfg.NZ - 1:
                     A[idx, idx] = 1.0
-                    B[idx] = self.cfg.P_ATM
+                    B[idx] = self.cfg.P_ATM # p0 in JSON
                     continue
 
                 aw, ae, asub, an = 0, 0, 0, 0
-                if i > 0: aw = coeff_D[i,j] * self.mesh.Af_w[i,j] * P_old[i,j] / self.mesh.dr
-                if i < self.cfg.NR-1: ae = coeff_D[i,j] * self.mesh.Af_e[i,j] * P_old[i,j] / self.mesh.dr
-                if j > 0: asub = coeff_D[i,j] * self.mesh.Af_s[i,j] * P_old[i,j] / self.mesh.dz
-                # North neighbor is j+1
-                an = coeff_D[i,j] * self.mesh.Af_n[i,j] * P_old[i,j] / self.mesh.dz
+                
+                # Radial Flux (Darcy)
+                if i > 0: 
+                    aw = molar_mobility[i,j] * self.mesh.Af_w[i,j] / self.mesh.dr
+                # BC: r=R (i=NR-1) is Impermeable Wall (ae remains 0)
 
-                ap0 = trans_const[i,j] * self.mesh.V[i,j]
+                if i < self.cfg.NR - 1: 
+                    ae = molar_mobility[i,j] * self.mesh.Af_e[i,j] / self.mesh.dr
+
+                # Axial Flux (Darcy)
+                if j > 0: 
+                    asub = molar_mobility[i,j] * self.mesh.Af_s[i,j] / self.mesh.dz
+                # BC: z=0 (j=0) is Impermeable Wall (asub remains 0 in flow logic)
+
+                an = molar_mobility[i,j] * self.mesh.Af_n[i,j] / self.mesh.dz
+
+                ap0 = molar_trans_const[i, j] * self.mesh.V[i, j]
                 ap = aw + ae + asub + an + ap0
                 
                 A[idx, idx] = ap
-                if i > 0: A[idx, idx - self.cfg.NZ] = -aw
-                if i < self.cfg.NR-1: A[idx, idx + self.cfg.NZ] = -ae
-                if j > 0: A[idx, idx - 1] = -asub
+                if i > 0:              A[idx, idx - self.cfg.NZ] = -aw
+                if i < self.cfg.NR - 1: A[idx, idx + self.cfg.NZ] = -ae
+                if j > 0:              A[idx, idx - 1] = -asub
                 if j < self.cfg.NZ - 1: A[idx, idx + 1] = -an
                 
-                B[idx] = ap0 * P_old[i,j] + S_gas_total[i,j] * self.mesh.V[i,j]
+                moles_source_rate = dn_generated[i, j] / self.cfg.DT
+                B[idx] = (ap0 * P_old[i, j]) + moles_source_rate
 
         return spsolve(A.tocsr(), B).reshape((self.cfg.NR, self.cfg.NZ))
 
-    def solve_heat(self, T_old, P, T_amb):
-        """ Implicit FVM for Energy: Conduction + Advection """
+    def solve_heat(self, T_old, P, T_amb, q_rxn):
+        """ 
+        Implicit FVM for Energy Balance.
+        Includes Advection + Conduction + Reaction Heat Source.
+        BCs (JSON): r=0 (Sym), r=R (Dirichlet Ramp), z=0 (Insulated), z=L (Insulated)
+        """
         A = sparse.lil_matrix((self.N, self.N))
         B = np.zeros(self.N)
         
-        # Calculate Darcy Velocities for Advection
-        # u = -(K/mu) * grad(P)
+        # Calculate Velocities from Darcy Law components (JSON Spec)
         ur = np.zeros_like(P); uz = np.zeros_like(P)
         ur[1:-1, :] = -(self.cfg.PERMEABILITY/self.cfg.MU_GAS) * (P[2:,:] - P[:-2,:])/(2*self.mesh.dr)
         uz[:, 1:-1] = -(self.cfg.PERMEABILITY/self.cfg.MU_GAS) * (P[:,2:] - P[:,:-2])/(2*self.mesh.dz)
@@ -63,36 +79,43 @@ class PackedBedSolver:
             for j in range(self.cfg.NZ):
                 idx = i * self.cfg.NZ + j
                 
+                # --- BC: Side (r=R) Dirichlet Boundary Heating (JSON Spec) ---
+                if i == self.cfg.NR - 1:
+                    A[idx, idx] = 1.0
+                    B[idx] = T_amb # T0 + beta*t
+                    continue
+
                 aw, ae, asub, an = 0, 0, 0, 0
+                
                 # Radial Conduction
                 if i > 0: aw = self.cfg.K_EFF * self.mesh.Af_w[i,j] / self.mesh.dr
-                if i < self.cfg.NR-1: ae = self.cfg.K_EFF * self.mesh.Af_e[i,j] / self.mesh.dr
-                else: B[idx] += self.cfg.H_CONV * self.mesh.Af_e[i,j] * T_amb
-                
-                # Axial Conduction
-                if j > 0: asub = self.cfg.K_EFF * self.mesh.Af_s[i,j] / self.mesh.dz
-                else: B[idx] += self.cfg.H_CONV * self.mesh.Af_s[i,j] * T_amb
-                
-                if j < self.cfg.NZ-1: an = self.cfg.K_EFF * self.mesh.Af_n[i,j] / self.mesh.dz
+                if i < self.cfg.NR - 1: ae = self.cfg.K_EFF * self.mesh.Af_e[i,j] / self.mesh.dr
 
-                # Advection term (Simplified Upwind)
-                # rho_g * Cp_g * u * Area * T
-                rho_g = (P[i,j]*self.cfg.M_GAS)/(self.cfg.R_GAS*T_old[i,j])
-                adv = rho_g * 1000.0 # Using 1000 as Cp for gas
-                if ur[i,j] > 0: ae += adv * ur[i,j] * self.mesh.Af_e[i,j]
-                else: aw += abs(adv * ur[i,j] * self.mesh.Af_w[i,j])
+                # Axial Conduction
+                # BC: z=0 and z=L are Neumann Insulated (asub and an remain 0 at boundaries)
+                if j > 0: asub = self.cfg.K_EFF * self.mesh.Af_s[i,j] / self.mesh.dz
+                if j < self.cfg.NZ - 1: an = self.cfg.K_EFF * self.mesh.Af_n[i,j] / self.mesh.dz
+
+                # Advection (Upwind scheme based on Darcy Velocity)
+                rho_g = (P[i,j] * self.cfg.MW_GAS_AVG) / (self.cfg.R_GAS * T_old[i,j])
+                adv_cap = rho_g * 1000.0 # Assumed Cp_gas
                 
+                if ur[i,j] > 0: ae += adv_cap * ur[i,j] * self.mesh.Af_e[i,j]
+                else: aw += abs(adv_cap * ur[i,j] * self.mesh.Af_w[i,j])
+                
+                if uz[i,j] > 0: an += adv_cap * uz[i,j] * self.mesh.Af_n[i,j]
+                else: asub += abs(adv_cap * uz[i,j] * self.mesh.Af_s[i,j])
+
                 ap0 = rho_cp_v_dt[i,j]
                 ap = aw + ae + asub + an + ap0
-                if i == self.cfg.NR-1: ap += self.cfg.H_CONV * self.mesh.Af_e[i,j]
-                if j == 0: ap += self.cfg.H_CONV * self.mesh.Af_s[i,j]
-
+                
                 A[idx, idx] = ap
-                if i > 0: A[idx, idx - self.cfg.NZ] = -aw
-                if i < self.cfg.NR-1: A[idx, idx + self.cfg.NZ] = -ae
-                if j > 0: A[idx, idx - 1] = -asub
+                if i > 0:              A[idx, idx - self.cfg.NZ] = -aw
+                if i < self.cfg.NR - 1: A[idx, idx + self.cfg.NZ] = -ae
+                if j > 0:              A[idx, idx - 1] = -asub
                 if j < self.cfg.NZ - 1: A[idx, idx + 1] = -an
                 
-                B[idx] += ap0 * T_old[i,j]
+                # Source: Accumulation + Reaction Heat Source (q_rxn = sum(dH * rho * r))
+                B[idx] = (ap0 * T_old[i,j]) + (q_rxn[i,j] * self.mesh.V[i,j])
 
         return spsolve(A.tocsr(), B).reshape((self.cfg.NR, self.cfg.NZ))
